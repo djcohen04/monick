@@ -1,160 +1,157 @@
 import time
-
-import asyncio
-from datetime import timedelta, datetime
-
 import pytz
-from typing import List
-
 import sched
-
+import logwood
+import asyncio
+import pandas as pd
+from typing import List
+from datetime import timedelta, datetime
 from src.utils.dateTimeInfo import DateTimeInfo
-
 from src.hedger.hedger_new import Hedger
 from src.order.orderStateHandler import OrderState
 from src.rabbit.rabbitProducerMQ import RabbitMQProducer
 from src.rithmic.marketFeedEnum import MarketFeed
 from src.hedgerAlias.aliasHedgerMi import AliasHedgerMI
 
-import logwood
-import pandas as pd
 
-# Class that represents the new hedger strategy
-class HedgerManualIntervention(Hedger):
-
-    """
-    ManualIntervention is a class based on the Hedger abstract class.
-    It can enter a trade before a trade has been placed and the hedger can be intervened manually.
-
-    Parameters:
-
-    logger, ==> logging object from logwood
-    session, ==> unique id for the trading session
-    producer, ==> rabbitmq producer to send orders
-    fcm_id, ==> info to use to connect to our provider Rithmic api
-    ib_id, ==> info to use to connect to our provider Rithmic api
-    locale,  ==> way to reference a strategy ==> combination of locale, city, street, tag
-    city, ==> way to reference a strategy ==> combination of locale, city, street, tag
-    street_name, ==>way to reference a strategy ==> combination of locale, city, street, tag
-    tag_name, ==> way to reference a strategy ==> combination of locale, city, street, tag
-    account_id, ==> account
-    mails, ==> list mail
-    level, ==> PAPER or PROD
-    initialisation_info, ==> basic information about strategy settings from mongo. Only at initialisation
-    alias, ==> alias class to have all information about alias. Alias are for example ES1
-    order, ==> order class to have all our orders and related function
-    queue_name, queue of message in rabbitmq
-    channel, channel in rabbitmq
-    df_info_alias ==> basic start dataframe information the aliases. Only at initialisation
-    """
-
-    # Initializer
-    def __init__(
-        self,
-        logger: logwood.Logger,
-        session: str,
-        producer: RabbitMQProducer,
-        locale: str,
-        fcm_id: str,
-        ib_id: str,
-        account_id,
-        city: str,
-        street_name: str,
-        tag_name: str,
-        mails: List[str],
-        level,
-        initialisation_info: pd.DataFrame,
-        alias,
-        order: OrderState,
-        queue_name: str,
-        channel, # Connection with RabbitMQ
-        df_info_alias: pd.DataFrame,
-        ):
-
-        super().__init__(logger, session, producer, locale, fcm_id, ib_id, account_id, city, street_name,
-                         tag_name, mails, level, initialisation_info, alias, order, queue_name,
-                         channel, df_info_alias)
-
-        self.start_hedge_date = None
-        self.tz = pytz.timezone("US/Eastern")
-
-    # Method for setting product information for the strategy
-    def set_hedger_alias(self, logger, initialisation_info, df_info_alias, locale, fcm_id, ib_id, account_id, city,
-                         street_name, tag_name, mails, level):
+class EmploymentPayrollTrader(Hedger):
+    def set_hedger_alias(self, **kwargs):
+        ''' Method for setting product information for the strategy
+        '''
         alias_mapper = dict()
-        basic_info = dict(logger=logger, locale=locale, fcm_id=fcm_id, ib_id=ib_id, tag_name=tag_name,
-                          account_id=account_id, city=city, street_name=street_name,
-                          mails=mails, level=level, session=self.session, producer=self.producer)
-        df_info_alias = df_info_alias.set_index(["symbol_alias"])
+
+        #
+        df_info_alias = kwargs.pop('df_info_alias').set_index(["symbol_alias"])
+        initialisation_info = kwargs.pop('initialisation_info')
+
+        #
+        basic_info = copy(kwargs)
+        basic_info['session'] = self.session
+        basic_info['producer'] = self.producer
+
+        #
         for symbol_alias in df_info_alias.index:
             self.logger.info(f'symbol_alias: {symbol_alias}')
             basic_info["symbol_alias"] = symbol_alias
             try:
-                info = {**basic_info, **df_info_alias.loc[symbol_alias].to_dict(),
-                        **initialisation_info.loc[symbol_alias].to_dict()}
+                info = {
+                    **basic_info,
+                    **df_info_alias.loc[symbol_alias].to_dict(),
+                    **initialisation_info.loc[symbol_alias].to_dict()
+                }
             except:
-                info = {**basic_info, **df_info_alias.loc[symbol_alias].to_dict()}
+                info = {
+                    **basic_info,
+                    **df_info_alias.loc[symbol_alias].to_dict()
+                }
+
             self.logger.info(f'info: {info}')
             if symbol_alias in initialisation_info.index:
                 for ticker in initialisation_info.loc[symbol_alias]["aliases_to_listen"]:
                     initialisation = initialisation_info.loc[symbol_alias].to_dict()
-                    keys = ["hedge_seconds_before_next_order", "hedge_start_time",
-                            "hedge_minimum_contract_size", "hedge_period", 'round_out_per_side', 'contract_size',
-                            'max_not_complete_orders_per_side', 'max_orders_per_price_level',
-                            'max_position', "action"]
+                    keys = [
+                        "hedge_seconds_before_next_order", "hedge_start_time",
+                        "hedge_minimum_contract_size", "hedge_period", 'round_out_per_side', 'contract_size',
+                        'max_not_complete_orders_per_side', 'max_orders_per_price_level',
+                        'max_position', "action"
+                    ]
                     initialisation_filter = {key: initialisation[key] for key in keys}
                     basic_info["symbol_alias"] = ticker
                     if ticker == symbol_alias:
                         more_info = dict(to_listen=True, is_tradable=True)
-                        alias_mapper[symbol_alias] = AliasHedgerMI(
-                            **{**basic_info, **df_info_alias.loc[symbol_alias].to_dict(),
-                               **initialisation_filter,
-                               **more_info})
+                        alias_mapper[symbol_alias] = AliasHedgerMI(**{
+                            **basic_info,
+                            **df_info_alias.loc[symbol_alias].to_dict(),
+                            **initialisation_filter,
+                            **more_info
+                        })
                     else:
                         more_info = dict(to_listen=True, is_tradable=True)
-                        alias_mapper[ticker] = AliasHedgerMI(**{**basic_info, **df_info_alias.loc[ticker].to_dict(),
-                                                              **initialisation_filter,
-                                                              **more_info})
+                        alias_mapper[ticker] = AliasHedgerMI(**{
+                            **basic_info,
+                            **df_info_alias.loc[ticker].to_dict(),
+                            **initialisation_filter,
+                            **more_info
+                        })
+
         return alias_mapper
 
     def update_feeds(self):
         pass
 
+
+# --------- MARK -----------
+
     def start_specific_scheduler(self, days: int = 0):
-        self.logger.info(f'.. start hedger scheduler')
-        for symbol_alias, alias in self.hedger_alias.items():
-            if alias.is_tradable:
-                if alias.action == 'hedger':
-                    for delay in range(alias.minimum_hedge_attempt):
-                        task_time_hedging = alias.eastern.localize(
-                            datetime.combine(DateTimeInfo.get_date() + timedelta(days=days), alias.hedge_start_time),
-                            is_dst=None).timestamp() + delay * alias.hedge_seconds_before_next_order
-                        if delay == 0:
-                            alias.hedging_datetime = task_time_hedging
-                            self.s.enterabs(time=task_time_hedging, priority=1, action=self.go_hedging,
-                                            kwargs={"alias": alias})
-                            self.logger.info(f'.. add new schedule hedging task FLAG for {task_time_hedging}')
-                        self.s.enterabs(time=task_time_hedging, priority=1, action=self.hedger_logic,
-                                        kwargs={"symbol_alias": symbol_alias})
-                        self.logger.info(f'.. add new schedule hedging task for {task_time_hedging}')
-                    task_time_hedging = (alias.eastern.localize(
-                        datetime.combine(DateTimeInfo.get_date() + timedelta(days=days), alias.hedge_start_time),
-                        is_dst=None) + alias.hedge_period).timestamp()
-                    self.logger.info(f'.. add last schedule hedging task for {task_time_hedging} with Market Order')
-                    self.s.enterabs(time=task_time_hedging, priority=1, action=self.hedger_logic,
-                                    kwargs={"symbol_alias": symbol_alias})
-                    task_time_hedging_final_check = (alias.eastern.localize(
-                        datetime.combine(DateTimeInfo.get_date() + timedelta(days=days), alias.hedge_start_time),
-                        is_dst=None) + alias.hedge_period).timestamp() + 10
-                    self.logger.info(
-                        f'.. add a schedule 10 sec after the market order was sent at {task_time_hedging_final_check}')
-                    self.s.enterabs(time=task_time_hedging_final_check, priority=1, action=self.hedger_logic,
-                                    kwargs={"symbol_alias": symbol_alias})
-                    task_time_hedging_alert = (alias.eastern.localize(
-                        datetime.combine(DateTimeInfo.get_date() + timedelta(days=days), alias.hedge_start_time),
-                        is_dst=None) + alias.hedge_period).timestamp() + 60
-                    self.logger.info(f'.. add last schedule email alert task for {task_time_hedging_alert}. HEDGING FAILED')
-                    self.s.enterabs(time=task_time_hedging_alert, priority=1, action=self.send_failed_email_alert)
+        ''' Do some initial scheduling
+        '''
+        # Pull the datetime of the next payroll announcement:
+        nextpayroll = self.next_payroll_announcement()
+
+        # Let's schedule our trade to start an hour before the announcement --
+        # this should be plenty of time to prepare for the trade to occur 15
+        # minutes before the announcement:
+        startime = nextpayroll - timedelta(hours=1)
+
+        # Schedule our trade to kick off on the target start time:
+        self.s.enterabs(time=startime, priority=1, action=self.tradepayroll, kwargs={'nextpayroll': nextpayroll})
+
+    def tradepayroll(self, nextpayroll):
+        ''' Do the payroll trade
+        '''
+        # Get employment forecast/actual data:
+        employment = self.getemployment()
+
+        # Determine the signal/strength based on the downloaded employment data:
+        signal = self.getsignal(employment)
+
+        # Get the symbols, weights that we want to trade:
+        positions = self.gettrades()
+
+        # Schedule a time that we will be MAKING the trades:
+        opentime = nextpayroll - timedelta(minutes=15)
+        self.s.enterabs(time=opentime, priority=1, action=self.opentrades, kwargs={'positions': positions})
+
+        # Schedule a time that we will be CLOSING the trades:
+        closetime = nextpayroll + timedelta(hours=2)
+        self.s.enterabs(time=closetime, priority=1, action=self.closetrades, kwargs={'positions': positions})
+
+        # Finally, later in the day, let's make sure to schedule the trade
+        # to run again on next month's payroll announcement:
+        reschedule = nextpayroll + timedelta(hours=12)
+        self.s.enterabs(time=reschedule, priority=1, action=self.reschedule)
+
+    def getemployment(self):
+        ''' Get employment forecast/actual data
+        '''
+        raise NotImplementedError
+
+    def getsignal(self, employment):
+        ''' Determine the signal/strength based on the downloaded employment data
+        '''
+        raise NotImplementedError
+
+    def gettrades(self):
+        ''' Get the symbols, weights that we want to trade
+        '''
+        raise NotImplementedError
+
+    def opentrades(self, positions):
+        ''' Open the given positions
+        '''
+        raise NotImplementedError
+
+    def closetrades(self, positions):
+        ''' Close the given positions
+        '''
+        raise NotImplementedError
+
+    def reschedule(self):
+        ''' Reschedule the trade based on next month's payroll announcement
+        '''
+        raise NotImplementedError
+
+# --------- END MARK -----------
 
     async def start_main_scheduler(self):
         await super(HedgerManualIntervention, self).start_main_scheduler()
