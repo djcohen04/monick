@@ -429,6 +429,10 @@ if __name__ == '__main__':
 
     # Initalize Payroll vs Equity Movers Research Class:
     payroll = PayrollMoversResearch(months=156, after=5)
-    symbols = ['@RTY#', 'EB#', 'IHO#']
+    # symbols = ['@RTY#', 'EB#', 'IHO#']
+    symbols = payroll.returns.columns.tolist()
     trades, stats = payroll.backtest(symbols, payroll.dates)
-    stats.round(4).to_csv('summary.csv', sep=';')
+    stats = stats.T.sort_values('total_pnl').T.round(2)
+    basket = stats.pop('basket')
+    stats['basket'] = basket
+    stats.to_csv('summary.csv', sep=';')
