@@ -1,5 +1,6 @@
 import datetime
 import traceback
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tabulate import tabulate
@@ -63,23 +64,46 @@ class AnnouncementResearch(object):
 
 
 class PayrollMoversResearch(object):
-    def __init__(self, months=36):
+    def __init__(self, months=36, before=15, after=120):
         ''' Research & Plot Biggest Movers Based on Payroll Announcement Misses
         '''
         self.investing = InvestingClient()
         self.months = months
+        self._cache = {}
+
+        # Minutes before/after payroll announcement positions are opened/closeed:
+        self.before = before
+        self.after = after
 
         # Download Payroll Announement Data:
         self.payrolls = self.investing.payrolls()
 
         # Load prices data which occurred during payroll announcements:
-        self.prices = self.loadprices()
+        self.returns = self.loadreturns()
 
         # Combine payroll announcements with price movements:
         self.data = self.combinedata()
 
-    def loadprices(self):
+        # Get all announcements data:
+        self.announcements = self.investing.getall()
+
+    def _loadprices(self, filename):
+        ''' Load Price Files
         '''
+        if filename in self._cache:
+            return self._cache[filename]
+        else:
+            # Parse timestamps into datetime objects:
+            prices = pd.read_csv(filename).bfill()
+            prices.index = prices['Unnamed: 0'].map(lambda ts: datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S'))
+            prices.drop('Unnamed: 0', axis=1, inplace=True)
+
+            # Save to cache & return prices:
+            self._cache[filename] = prices
+            return self._cache[filename]
+
+    def loadreturns(self):
+        ''' Load aggregated returns dataframe from all potential trade events
         '''
         allreturns = {}
         for _, announcement in self.payrolls[-self.months:].iterrows():
@@ -87,28 +111,25 @@ class PayrollMoversResearch(object):
                 # Download equity prices on the day of this payroll announcement
                 # to determine biggest movers:
                 filename = 'clients/datasets/prices/%s.csv' % announcement.date
-                prices = pd.read_csv(filename).bfill()
-
-                # Parse timestamps into datetime objects:
-                prices.index = prices.time.map(lambda ts: datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S+00:00'))
-                prices.drop('time', axis=1, inplace=True)
+                prices = self._loadprices(filename)
 
                 # Get the time window on this announcement date that we want to
                 # analye for equity price movement (for this research, the analysis
-                # is simple -- compare the largest movers based on the price 15
+                # is simple -- compare the largest movers based on the price N
                 # minutes before the payroll announcement with the price 2 hours
                 # after the accounement):
                 dt = datetime.datetime.combine(announcement.date, announcement.time)
-                start = dt - datetime.timedelta(minutes=15)
-                end = dt + datetime.timedelta(minutes=120)
+                start = dt - datetime.timedelta(minutes=self.before)
+                end = dt + datetime.timedelta(minutes=self.after)
 
                 # Compute the total return of the vehicle over the investment window:
                 returns = 100 * (prices.loc[end] / prices.loc[start] - 1.)
 
                 # Save results for this date:
                 allreturns[announcement.date] = returns
-            except:
-                print('WARN: An Error Occurred Fetching Prices on %s, Skipping...' % announcement.date)
+            except Exception as e:
+                pass
+                # print('WARN: An Error Occurred Fetching Prices on %s: %s (Skipping)' % (announcement.date, e))
 
         # Combine price changes from all symbols for all available dates:
         return pd.DataFrame(allreturns).T
@@ -118,7 +139,7 @@ class PayrollMoversResearch(object):
         '''
         # Create some copies of our instance datasets (to preserve method purity):
         payrolls = self.payrolls.copy()
-        prices = self.prices.copy()
+        prices = self.returns.copy()
         payrolls.index = payrolls.date
 
         # Limit payroll dataset based on available prices data:
@@ -133,17 +154,56 @@ class PayrollMoversResearch(object):
         # values:
         return prices
 
-    @property
-    def correlations(self):
+    def correlations(self, dates=None):
         ''' Compute Price Movement Correlations with Payroll Announcments
         '''
-        return self.data.corr()['payroll']
+        if dates:
+            # Use the subset of dates given to compute the signal/future
+            # product correlations:
+            return self.data.loc[dates].corr()['payroll']
+        else:
+            return self.data.corr()['payroll']
 
-    def barchart(self, top=20):
+    @classmethod
+    def smooth(cls, series, span=1):
+        ''' Smooth the given time series
+        '''
+        smoothed = series.copy()
+        for i in series.index:
+            smoothed[i] = series.loc[(i - span - 1):(i + span)].mean()
+
+        return smoothed
+
+    @property
+    def timeheld(self):
+        ''' Compute Time Each Trade is Held in Days
+        '''
+        return (self.after + self.before) / (60. * 23.)
+
+    @property
+    def dates(self):
+        ''' Get all available sample dates
+        '''
+        payrolls = set(self.payrolls.date)
+        returns = set(self.returns.index)
+        return sorted(payrolls.intersection(returns))
+
+    def splitdates(self, split=0.6):
+        ''' Get random split of available sample dates
+        '''
+        dates = self.dates
+        count = len(dates)
+        pivot = int(split * count)
+        np.random.shuffle(dates)
+        train = sorted(dates[:pivot])
+        test = sorted(dates[pivot:])
+        return train, test
+
+    def barchart(self, top=20, dates=None):
         ''' Plot A Barchart Showing Correlations Between
         '''
         # Get sorted correlations, filter by top N items:
-        corrs = self.topcorrs(top)
+        corrs = self.topcorrs(top, dates=dates)
 
         # Setup Plot:
         index = range(corrs.shape[0])
@@ -155,37 +215,36 @@ class PayrollMoversResearch(object):
         plt.title('Equity Correlations w Payroll (Announcement - Forecast)')
         plt.ylabel('CORRELATION')
         plt.xlabel('SYMBOL')
+        plt.xticks(rotation=45)
 
         # Show Plot:
         plt.show()
 
-    def topcorrs(self, top=20):
+    def topcorrs(self, top=20, dates=None):
         ''' Get top N correlated equities with payroll numbers
         '''
-        return self.correlations.sort_values().dropna().drop('payroll')[-top:]
+        return self.correlations(dates).sort_values().dropna().drop('payroll')[-top:]
 
-    def backtest(self, symbols):
+    def backtest(self, symbols, dates):
         '''
         '''
-        economic = self.investing.getall()
-
         # Get the months that we have pricing information on:
-        months = self.prices.index.map(lambda dt: dt.strftime('%Y-%m'))
+        months = self.returns.loc[dates].index.map(lambda dt: dt.strftime('%Y-%m'))
 
         # Get employment announcment values (this is our trading signal):
-        employment = economic.loc[months].dropna()[['emp-diff', 'pay-date']]
+        employment = self.announcements.copy().loc[months].dropna()[['emp-diff', 'pay-date']]
         employment.index = employment['pay-date']
 
         # Compute the trading signal:
-        signal = employment['emp-diff'].loc[self.prices.index].dropna()
+        signal = employment['emp-diff'].loc[self.returns.loc[dates].index].dropna()
         signal[signal > 0] = 1.
         signal[signal < 0] = -1.
 
         # Get prices subframe for these symbols:
-        prices = self.prices.copy().loc[signal.index][symbols]
+        returns = self.returns.loc[dates].copy().loc[signal.index][symbols]
 
         # Compute trades on symbols based on signals:
-        trades = prices.multiply(signal, axis=0)
+        trades = returns.multiply(signal, axis=0)
 
         summary = {}
         for symbol in symbols:
@@ -196,7 +255,7 @@ class PayrollMoversResearch(object):
                 'max': trades[symbol].max(),
                 '50%': trades[symbol].median(),
                 'win%': (trades[trades[symbol] > 0].count()[symbol]) / float(trades[symbol].count()) * 100.,
-                'sharpe': trades[symbol].mean() / trades[symbol].std()
+                'sharpe': trades[symbol].mean() / trades[symbol].std() * ((252. / self.timeheld / 12.) ** 0.5)
             }
 
         stats = pd.DataFrame(summary)
@@ -210,31 +269,122 @@ class PayrollMoversResearch(object):
             'max': basket.max(),
             '50%': basket.median(),
             'win%': (basket[basket > 0].count()) / float(basket.count()) * 100.,
-            'sharpe': basket.mean() / basket.std()
+            'sharpe': basket.mean() / basket.std() * ((252. / self.timeheld / 12.) ** 0.5)
         }
         stats['basket'] = pd.Series(basketstats)
 
         return trades, stats
 
+    def scan(self, symbols, dates, lower=1, upper=120, smoothed=True, plot=True):
+        ''' Scan over trade window/basket combinations
+        '''
+        original = self.after
+        try:
+            # Break out symbols into baskets, so we can anaylze each basket's
+            # sharpe ratios individually:
+            baskets = {
+                tuple(symbols[-i:]): []
+                for i in range(3, len(symbols) + 1)
+            }
+
+            # Iterate over window sizes:
+            for after in range(lower, upper + 1):
+
+                #
+                self.after = after
+                print 'Scanning (%s-%s) Window...' % (self.before, self.after)
+                self.returns = self.loadreturns()
+
+                # For each product basket, get backtest stats
+                for basket in baskets:
+                    _, stats = self.backtest(list(basket), dates=dates)
+                    baskets[basket].append(stats.basket.sharpe)
+
+            # Maybe Smooth Data Series:
+            if smoothed:
+                for key in baskets:
+                    series = pd.Series(baskets[key])
+                    baskets[key] = self.smooth(series)
+
+            # Maybe plot the resulting sharpe ladders:
+            if plot:
+                # Initialize Our Line Plot:
+                plt.figure(figsize=(28, 16))
+
+                # Plot the sharpe-ratio/minute surfaces for each basket:
+                minutes = list(range(lower, upper + 1))
+                for basket in sorted(baskets.keys(), key=lambda x: len(x), reverse=True):
+                    sharpes = baskets[basket]
+                    plt.plot(minutes, sharpes, label='-'.join(reversed(basket)), lw=2.)
+
+                # Plot Target Sharpe Ratio
+                target = 2.0
+                plt.hlines(target, lower, upper, colors=ColorClient.lightgray, label='Target Sharpe (%s)' % target)
+
+                # Add some axis labeling & save plot:
+                plt.title('Sharpe Ratios Across Trade Windows & Baskets')
+                plt.ylabel('SHARPE (annualized)')
+                plt.xlabel('TRADE WINDOW (min. after payroll announcement)')
+                plt.legend()
+                plt.savefig('sharpes.png', bbox_inches='tight')
+                plt.close()
+
+        finally:
+            # Revert after and prices value back to original amount:
+            self.after = original
+            self.returns = self.loadreturns()
+
+        return pd.DataFrame(baskets, index=minutes)
+
 
 if __name__ == '__main__':
-    # Initialize Research Client:
-    announcements = AnnouncementResearch()
-
-    # Print last 10 rows of combined dataframe:
-    print('\nPayroll vs Employment (Last 12 months):')
-    print(announcements.data.tail(12))
-
-    # Build a scatter plot:
-    announcements.scatter()
+    # # Initialize Research Client:
+    # announcements = AnnouncementResearch()
+    #
+    # # Print last 10 rows of combined dataframe:
+    # print('\nPayroll vs Employment (Last 12 months):')
+    # print(announcements.data.tail(12))
+    #
+    # # Build a scatter plot:
+    # announcements.scatter()
 
     # Initalize Payroll vs Equity Movers Research Class:
-    payroll = PayrollMoversResearch()
+    payroll = PayrollMoversResearch(months=156, after=60)
 
-    # Plot top 20 Correlated Movers:
-    payroll.barchart()
+    # Get a train/test date split of available announcement dates:
+    train, test = payroll.splitdates(0.5)
 
-    # Run backtest:
-    symbols = payroll.topcorrs(10).index
-    trades, stats = payroll.backtest(symbols)
-    print(tabulate(stats, headers=stats.columns, tablefmt="github"))
+    # # Plot top 20 Correlated Movers:
+    # payroll.barchart(dates=train)
+
+    # Get the top 20 highest correlated stocks based on training sample:
+    print 'Optimizing trade basket/exit...'
+    symbols = payroll.topcorrs(6, dates=train).index
+
+    # Scan across all trading windows and sub-baskets for the top-correlated
+    # symbols based on training data:
+    sharpes = payroll.scan(symbols, upper=80, dates=train, plot=True)
+
+
+    # Get the basket/window with the maximum sharpe ratio:
+    maxbasket = sorted([s for s in sharpes.max().idxmax() if isinstance(s, str)])
+    maxwindow = sharpes.idxmax()[sharpes.max().idxmax()]
+
+    # Print out results:
+    print 'Found Optimal Solution: %s 15-%s (Sharpe=%.4f)' % (
+        maxbasket,
+        maxwindow,
+        sharpes.max().max()
+    )
+
+    # Do in-sample testing with best basket/window from above:
+    print 'In Sample Stats:'
+    _, stats = payroll.backtest(maxbasket, dates=train)
+    print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
+
+    print '\n~~~~~~~~~~~~~~~~~~\n'
+
+    # Do out-of-sample testing with best basket/window from above:
+    print 'Out-of-Sample Stats:'
+    _, stats = payroll.backtest(maxbasket, dates=test)
+    print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
