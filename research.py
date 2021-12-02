@@ -79,7 +79,7 @@ class PayrollMoversResearch(object):
         self.payrolls = self.investing.payrolls()
 
         # Load prices data which occurred during payroll announcements:
-        self.returns = self.loadreturns()
+        self.loadreturns()
 
         # Combine payroll announcements with price movements:
         self.data = self.combinedata()
@@ -106,6 +106,8 @@ class PayrollMoversResearch(object):
         ''' Load aggregated returns dataframe from all potential trade events
         '''
         allreturns = {}
+        allchanges = {}
+        allcosts = {}
         for _, announcement in self.payrolls[-self.months:].iterrows():
             try:
                 # Download equity prices on the day of this payroll announcement
@@ -122,17 +124,24 @@ class PayrollMoversResearch(object):
                 start = dt - datetime.timedelta(minutes=self.before)
                 end = dt + datetime.timedelta(minutes=self.after)
 
-                # Compute the total return of the vehicle over the investment window:
+                # Compute the total return of the vehicle over the investment
+                # window, the change in product price, and the product cost:
                 returns = 100 * (prices.loc[end] / prices.loc[start] - 1.)
+                change = prices.loc[end] - prices.loc[start]
+                cost = prices.loc[start]
 
                 # Save results for this date:
                 allreturns[announcement.date] = returns
+                allchanges[announcement.date] = change
+                allcosts[announcement.date]   = cost
             except Exception as e:
                 pass
                 # print('WARN: An Error Occurred Fetching Prices on %s: %s (Skipping)' % (announcement.date, e))
 
-        # Combine price changes from all symbols for all available dates:
-        return pd.DataFrame(allreturns).T
+        # Aggregate price changes, returns, and costs for all dates:
+        self.returns = pd.DataFrame(allreturns).T
+        self.changes = pd.DataFrame(allchanges).T
+        self.costs = pd.DataFrame(allcosts).T
 
     def combinedata(self):
         ''' Combine price movement dataset with payroll announcement forecasts
@@ -240,11 +249,10 @@ class PayrollMoversResearch(object):
         signal[signal > 0] = 1.
         signal[signal < 0] = -1.
 
-        # Get prices subframe for these symbols:
-        returns = self.returns.loc[dates].copy().loc[signal.index][symbols]
-
         # Compute trades on symbols based on signals:
-        trades = returns.multiply(signal, axis=0)
+        returns = self.returns.loc[signal.index][symbols].fillna(0.).multiply(signal, axis=0)
+        trades = self.changes.loc[signal.index][symbols].fillna(0.).multiply(signal, axis=0)
+        costs = self.costs.loc[signal.index][symbols].fillna(0.).multiply(signal, axis=0)
 
         summary = {}
         for symbol in symbols:
@@ -253,8 +261,17 @@ class PayrollMoversResearch(object):
                 'count': trades[symbol].count(),
                 'min': trades[symbol].min(),
                 'max': trades[symbol].max(),
-                '50%': trades[symbol].median(),
-                'win%': (trades[trades[symbol] > 0].count()[symbol]) / float(trades[symbol].count()) * 100.,
+                '50(%)': trades[symbol].median(),
+                '25(%)': np.percentile(trades[symbol].dropna(), 25.),
+                '75(%)': np.percentile(trades[symbol].dropna(), 75.),
+                'total_dates': len(trades[symbol]),
+                'total_pnl': trades[symbol].sum(),
+                'total_volume': trades[symbol].count(),
+                'std_unit_pnl': trades[symbol].std(),
+                'std_daily_pnl': trades[symbol].std(),
+                'mean_unit_pnl': trades[symbol].mean(),
+                'average_daily_pnl': trades[symbol].mean(),
+                'win(%)': (trades[trades[symbol] > 0].count()[symbol]) / float(trades[symbol].count()) * 100.,
                 'sharpe': trades[symbol].mean() / trades[symbol].std() * ((252. / self.timeheld / 12.) ** 0.5)
             }
 
@@ -267,13 +284,33 @@ class PayrollMoversResearch(object):
             'count': stats.T['count'].sum(),
             'min': basket.min(),
             'max': basket.max(),
-            '50%': basket.median(),
-            'win%': (basket[basket > 0].count()) / float(basket.count()) * 100.,
+            '50(%)': basket.median(),
+            '25(%)': np.percentile(basket.dropna(), 25.),
+            '75(%)': np.percentile(basket.dropna(), 75.),
+            'total_pnl': basket.sum(),
+            'std_unit_pnl': basket.std(),
+            'std_daily_pnl': basket.std(),
+            'mean_unit_pnl': basket.mean(),
+            'average_daily_pnl': basket.mean(),
+            'total_dates': len(basket),
+            'total_volume': stats.T['count'].sum(),
+            'win(%)': (basket[basket > 0].count()) / float(basket.count()) * 100.,
             'sharpe': basket.mean() / basket.std() * ((252. / self.timeheld / 12.) ** 0.5)
         }
         stats['basket'] = pd.Series(basketstats)
 
+        # Reorder index to match required convention:
+        stats = stats.T[[
+            'count', 'mean', 'min', '25(%)', '50(%)', '75(%)', 'max', 'win(%)',
+            'mean_unit_pnl', 'std_unit_pnl', 'average_daily_pnl', 'total_dates',
+            'std_daily_pnl', 'sharpe', 'total_pnl', 'total_volume'
+        ]].T
+
+        # Assign an index name:
+        stats.index.name = 'statistic'
+
         return trades, stats
+
 
     def scan(self, symbols, dates, lower=1, upper=120, smoothed=True, plot=True):
         ''' Scan over trade window/basket combinations
@@ -293,7 +330,7 @@ class PayrollMoversResearch(object):
                 #
                 self.after = after
                 print 'Scanning (%s-%s) Window...' % (self.before, self.after)
-                self.returns = self.loadreturns()
+                self.loadreturns()
 
                 # For each product basket, get backtest stats
                 for basket in baskets:
@@ -332,7 +369,7 @@ class PayrollMoversResearch(object):
         finally:
             # Revert after and prices value back to original amount:
             self.after = original
-            self.returns = self.loadreturns()
+            self.loadreturns()
 
         return pd.DataFrame(baskets, index=minutes)
 
@@ -348,43 +385,50 @@ if __name__ == '__main__':
     # # Build a scatter plot:
     # announcements.scatter()
 
+    # # Initalize Payroll vs Equity Movers Research Class:
+    # payroll = PayrollMoversResearch(months=156, after=60)
+    #
+    # # Get a train/test date split of available announcement dates:
+    # train, test = payroll.splitdates(0.5)
+    #
+    # # # Plot top 20 Correlated Movers:
+    # # payroll.barchart(dates=train)
+    #
+    # # Get the top 20 highest correlated stocks based on training sample:
+    # print 'Optimizing trade basket/exit...'
+    # symbols = payroll.topcorrs(6, dates=train).index
+    #
+    # # Scan across all trading windows and sub-baskets for the top-correlated
+    # # symbols based on training data:
+    # sharpes = payroll.scan(symbols, upper=80, dates=train, plot=True)
+    #
+    #
+    # # Get the basket/window with the maximum sharpe ratio:
+    # maxbasket = sorted([s for s in sharpes.max().idxmax() if isinstance(s, str)])
+    # maxwindow = sharpes.idxmax()[sharpes.max().idxmax()]
+    #
+    # # Print out results:
+    # print 'Found Optimal Solution: %s 15-%s (Sharpe=%.4f)' % (
+    #     maxbasket,
+    #     maxwindow,
+    #     sharpes.max().max()
+    # )
+    #
+    # # Do in-sample testing with best basket/window from above:
+    # print 'In Sample Stats:'
+    # _, stats = payroll.backtest(maxbasket, dates=train)
+    # print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
+    #
+    # print '\n~~~~~~~~~~~~~~~~~~\n'
+    #
+    # # Do out-of-sample testing with best basket/window from above:
+    # print 'Out-of-Sample Stats:'
+    # _, stats = payroll.backtest(maxbasket, dates=test)
+    # print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
+
+
     # Initalize Payroll vs Equity Movers Research Class:
-    payroll = PayrollMoversResearch(months=156, after=60)
-
-    # Get a train/test date split of available announcement dates:
-    train, test = payroll.splitdates(0.5)
-
-    # # Plot top 20 Correlated Movers:
-    # payroll.barchart(dates=train)
-
-    # Get the top 20 highest correlated stocks based on training sample:
-    print 'Optimizing trade basket/exit...'
-    symbols = payroll.topcorrs(6, dates=train).index
-
-    # Scan across all trading windows and sub-baskets for the top-correlated
-    # symbols based on training data:
-    sharpes = payroll.scan(symbols, upper=80, dates=train, plot=True)
-
-
-    # Get the basket/window with the maximum sharpe ratio:
-    maxbasket = sorted([s for s in sharpes.max().idxmax() if isinstance(s, str)])
-    maxwindow = sharpes.idxmax()[sharpes.max().idxmax()]
-
-    # Print out results:
-    print 'Found Optimal Solution: %s 15-%s (Sharpe=%.4f)' % (
-        maxbasket,
-        maxwindow,
-        sharpes.max().max()
-    )
-
-    # Do in-sample testing with best basket/window from above:
-    print 'In Sample Stats:'
-    _, stats = payroll.backtest(maxbasket, dates=train)
-    print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
-
-    print '\n~~~~~~~~~~~~~~~~~~\n'
-
-    # Do out-of-sample testing with best basket/window from above:
-    print 'Out-of-Sample Stats:'
-    _, stats = payroll.backtest(maxbasket, dates=test)
-    print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
+    payroll = PayrollMoversResearch(months=156, after=5)
+    symbols = ['@RTY#', 'EB#', 'IHO#']
+    trades, stats = payroll.backtest(symbols, payroll.dates)
+    stats.round(4).to_csv('summary.csv', sep=';')
