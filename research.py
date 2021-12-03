@@ -1,3 +1,4 @@
+import json
 import datetime
 import traceback
 import numpy as np
@@ -208,6 +209,30 @@ class PayrollMoversResearch(object):
         test = sorted(dates[pivot:])
         return train, test
 
+    def getproducts(self):
+        ''' Get a DataFrame of Products
+        '''
+        codes = []
+        with open('clients/datasets/products.txt', 'r') as products:
+            for product in products:
+                codes.append(json.loads(product))
+
+        codes = pd.DataFrame(codes)
+        mapping = self.getsymbolmap()
+        codes.index = codes.product_code.map(lambda c: mapping.get(c))
+
+        # Drop some unused columns:
+        codes.drop(['session_timedeltas', 'session_timestamps'], axis=1, inplace=True)
+
+        return codes
+
+    def getsymbolmap(self):
+        ''' Get IQFeed Symbol Mapping
+        '''
+        symbols = pd.read_csv('clients/datasets/iqfeed_symbols.csv')
+        symbols.index = symbols.Symbol
+        return symbols.SymbolIQFeed.to_dict()
+
     def barchart(self, top=20, dates=None):
         ''' Plot A Barchart Showing Correlations Between
         '''
@@ -254,9 +279,18 @@ class PayrollMoversResearch(object):
         trades = self.changes.loc[signal.index][symbols].fillna(0.).multiply(signal, axis=0)
         costs = self.costs.loc[signal.index][symbols].fillna(0.).multiply(signal, axis=0)
 
+        # Get futures product codes and tick values:
+        products = self.getproducts()
+        codes = products.loc[symbols].product_code
+        sizes = products.loc[symbols].contract_size
+
+        # Adjust trade data based on futures contract sizes:
+        trades *= sizes
+
+        # Get summary stats for all symbols:
         summary = {}
         for symbol in symbols:
-            summary[symbol] = {
+            summary[codes[symbol]] = {
                 'mean': trades[symbol].mean(),
                 'count': trades[symbol].count(),
                 'min': trades[symbol].min(),
@@ -271,14 +305,14 @@ class PayrollMoversResearch(object):
                 'std_daily_pnl': trades[symbol].std(),
                 'mean_unit_pnl': trades[symbol].mean(),
                 'average_daily_pnl': trades[symbol].mean(),
-                'win(%)': (trades[trades[symbol] > 0].count()[symbol]) / float(trades[symbol].count()) * 100.,
-                'sharpe': trades[symbol].mean() / trades[symbol].std() * ((252. / self.timeheld / 12.) ** 0.5)
+                'win(%)': (trades[trades[symbol] >= 0].count()[symbol]) / float(trades[symbol].count()) * 100.,
+                'sharpe': returns[symbol].mean() / returns[symbol].std() * ((252. / self.timeheld / 12.) ** 0.5)
             }
 
         stats = pd.DataFrame(summary)
 
         # Compute basket stats:
-        basket = trades.T.mean()
+        basket = trades.sum(axis=1)
         basketstats = {
             'mean': basket.mean(),
             'count': stats.T['count'].sum(),
@@ -294,7 +328,7 @@ class PayrollMoversResearch(object):
             'average_daily_pnl': basket.mean(),
             'total_dates': len(basket),
             'total_volume': stats.T['count'].sum(),
-            'win(%)': (basket[basket > 0].count()) / float(basket.count()) * 100.,
+            'win(%)': (basket[basket >= 0].count()) / float(basket.count()) * 100.,
             'sharpe': basket.mean() / basket.std() * ((252. / self.timeheld / 12.) ** 0.5)
         }
         stats['basket'] = pd.Series(basketstats)
@@ -304,7 +338,10 @@ class PayrollMoversResearch(object):
             'count', 'mean', 'min', '25(%)', '50(%)', '75(%)', 'max', 'win(%)',
             'mean_unit_pnl', 'std_unit_pnl', 'average_daily_pnl', 'total_dates',
             'std_daily_pnl', 'sharpe', 'total_pnl', 'total_volume'
-        ]].T
+        ]].sort_values('total_pnl', ascending=False).T.round(2)
+
+        # Move basket column back to end of table:
+        stats['basket'] = stats.pop('basket')
 
         # Assign an index name:
         stats.index.name = 'statistic'
@@ -426,13 +463,10 @@ if __name__ == '__main__':
     # _, stats = payroll.backtest(maxbasket, dates=test)
     # print(tabulate(stats.round(3), headers=stats.columns, tablefmt='github'))
 
-
     # Initalize Payroll vs Equity Movers Research Class:
     payroll = PayrollMoversResearch(months=156, after=5)
-    # symbols = ['@RTY#', 'EB#', 'IHO#']
-    symbols = payroll.returns.columns.tolist()
+    symbols = ['CRD#', 'QSI#', 'QCL#']
+    # symbols = [s for s in payroll.returns.columns.tolist() if s not in ('@VX#', 'QC#')]
     trades, stats = payroll.backtest(symbols, payroll.dates)
-    stats = stats.T.sort_values('total_pnl').T.round(2)
-    basket = stats.pop('basket')
-    stats['basket'] = basket
     stats.to_csv('summary.csv', sep=';')
+    print(tabulate(stats, headers=stats.columns, tablefmt='github'))
